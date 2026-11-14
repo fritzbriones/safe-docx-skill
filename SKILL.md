@@ -105,7 +105,7 @@ python3 safe_pdf_read.py input.pdf
 
 If user asks to change a PDF:
 1. Ask for the source DOCX.
-2. Edit the DOCX with `safe_docx_edit.py`.
+2. Edit the DOCX with `safe_docx_edit_v3_2.py`.
 3. Tell user: "Export PDF from Word on your computer." You have no Office / LibreOffice / pandoc, so you cannot render a faithful PDF. Your PDF builder with Times core fonts is approximation only.
 
 If there is no DOCX source, return a change list only, NOT a new PDF.

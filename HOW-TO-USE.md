@@ -1,6 +1,6 @@
-# How to Use This Package
+# How to Use This Repo
 
-This zip contains the complete **Safe DOCX** skill — ready to upload to GitHub or use directly.
+This repo contains the complete **Safe DOCX** skill.
 
 ## What's inside
 
@@ -17,7 +17,7 @@ safe-docx/
 └── .gitignore
 ```
 
-## How to download / get the files onto GitHub
+## How to get the files
 
 **Option A — GitHub web upload (easiest, no tools needed):**
 1. Unzip this file to a folder.
