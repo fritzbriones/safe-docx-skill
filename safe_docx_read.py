@@ -1,117 +1,173 @@
 #!/usr/bin/env python3
 """
-safe_docx_read.py - Read a DOCX properly with Python stdlib ONLY.
-No python-docx, no Pillow, no Office. Uses zipfile + xml.etree only.
+safe_docx_read.py - Read-only health check for a .docx. Python 3 stdlib only.
 
 Usage:
-  python3 safe_docx_read.py input.docx
-  python3 safe_docx_read.py input.docx --full-text
+  python3 safe_docx_read.py input.docx              # health report + outline
+  python3 safe_docx_read.py input.docx --full-text  # also every paragraph with its style
+  python3 safe_docx_read.py input.docx --protect "A*" --protect "p < .05"
 
-What it does:
-  - Opens the DOCX as a ZIP (a DOCX IS a ZIP of XML + images)
-  - Lists every part, with SHA256 for images (to prove they are unchanged later)
-  - Lists paragraphs with their STYLE (Heading 1, Title, Normal) - not just text
-  - Lists tables with their real column widths (gridCol)
-  - Counts A* (critical for ABDC), highlights, tracked changes
-  - NEVER rebuilds the file. Read-only.
+Reports:
+  * whether you have REAL file bytes (a ZIP) or only a text extract;
+  * every ZIP part with size and full SHA-256 for images;
+  * styles.xml size, theme presence, paragraph styles in use (headings!);
+  * table column widths from <w:tblGrid> (equal widths = likely rebuilt);
+  * header/footer parts and whether they hold PAGE fields;
+  * counts: protected literals (A* by default), highlights, tracked changes,
+    comments, xml:space, images;
+  * DAMAGE WARNINGS: signs the file was rebuilt from text.
+
+Exit status: 0 = read OK, 2 = not a DOCX (no real bytes), 1 = other error.
+Never modifies the file.
 """
-import sys, zipfile, hashlib, re
-import xml.etree.ElementTree as ET
+import argparse, hashlib, re, sys, zipfile
+from collections import Counter
 
-W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_ENTITY_RE = re.compile(r"&(#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);")
+_NAMED = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
 
-def sha(b):
-    return hashlib.sha256(b).hexdigest()[:16]
 
-def get_text_of_p(p_elem):
-    texts = []
-    for t in p_elem.iter(W+"t"):
-        texts.append(t.text or "")
-    return "".join(texts)
+def unescape(s):
+    def _d(m):
+        e = m.group(1)
+        if e.startswith("#x"):
+            return chr(int(e[2:], 16))
+        if e.startswith("#"):
+            return chr(int(e[1:]))
+        return _NAMED[e]
+    return _ENTITY_RE.sub(_d, s)
+
+
+WT_RE = re.compile(r"<w:t(?:\s[^>]*)?>(.*?)</w:t>", re.DOTALL)
+P_RE = re.compile(r"<w:p(?:\s[^>]*)?(?<!/)>.*?</w:p>", re.DOTALL)
+PSTYLE_RE = re.compile(r'<w:pStyle\s+w:val="([^"]+)"')
+TBL_RE = re.compile(r"<w:tbl>.*?</w:tbl>", re.DOTALL)
+GRID_RE = re.compile(r'<w:gridCol\s+w:w="(\d+)"')
+
+
+def style_names(styles_xml):
+    names = {}
+    for m in re.finditer(r'<w:style\b[^>]*w:styleId="([^"]+)"[^>]*>(.*?)</w:style>', styles_xml, re.DOTALL):
+        n = re.search(r'<w:name\s+w:val="([^"]+)"', m.group(2))
+        names[m.group(1)] = n.group(1) if n else m.group(1)
+    return names
+
+
+def para_list(doc_xml, names):
+    out = []
+    for p in P_RE.finditer(doc_xml):
+        block = p.group(0)
+        s = PSTYLE_RE.search(block)
+        sid = s.group(1) if s else "Normal"
+        text = "".join(unescape(t) for t in WT_RE.findall(block))
+        out.append((names.get(sid, sid), text))
+    return out
+
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 safe_docx_read.py input.docx [--full-text]")
-        sys.exit(1)
-    path = sys.argv[1]
-    full = "--full-text" in sys.argv
-    with zipfile.ZipFile(path) as z:
-        names = z.namelist()
-        print(f"FILE: {path}")
-        print(f"PARTS: {len(names)}")
-        for n in names:
-            data = z.read(n)
-            extra = ""
-            if n.startswith("word/media/"):
-                extra = f"  bytes={len(data)} sha={sha(data)}  <-- IMAGE, never re-encode"
-            print(f"  {n}  {len(data)} bytes{extra}")
-        print()
-        # document.xml
-        xml_bytes = z.read("word/document.xml")
-        xml_text = xml_bytes.decode("utf-8", errors="replace")
-        print(f"CHECKS in word/document.xml:")
-        print(f"  w:highlight count (should be 0 for final): {xml_text.count('w:highlight')}")
-        print(f"  A* count (ABDC, must not drop *): {xml_text.count('A*')}")
-        # w:ins that are real insertions vs insideH borders: look for <w:ins 
-        print(f"  <w:ins tracked insertions: {xml_text.count('<w:ins ')+xml_text.count('<w:ins>')}")
-        print()
-        root = ET.fromstring(xml_bytes)
-        # Paragraphs
-        print("PARAGRAPHS (style + text):")
-        for i, p in enumerate(root.iter(W+"p")):
-            pPr = p.find(W+"pPr")
-            style = "Normal"
-            if pPr is not None:
-                s = pPr.find(W+"pStyle")
-                if s is not None:
-                    style = s.get(W+"val", "Normal")
-                    # Word stores as Heading1, Title, etc. Show as Heading 1 for humans
-                    if style == "Heading1":
-                        style = "Heading 1"
-                    elif style == "Heading2":
-                        style = "Heading 2"
-                    elif style == "Heading3":
-                        style = "Heading 3"
-            txt = get_text_of_p(p)
-            if not txt.strip():
-                continue
-            if full or style != "Normal" or len(txt) < 120:
-                print(f"  [{i:03d}] [{style}] {txt[:180]}")
-            else:
-                print(f"  [{i:03d}] [{style}] {txt[:120]}...")
-        print()
-        # Tables
-        print("TABLES (real column widths, not guessed):")
-        for ti, tbl in enumerate(root.iter(W+"tbl")):
-            grid = tbl.find(W+"tblGrid")
-            widths = []
-            if grid is not None:
-                for gc in grid.findall(W+"gridCol"):
-                    widths.append(gc.get(W+"w"))
-            rows = list(tbl.findall(W+"tr"))
-            cols = len(widths) if widths else 0
-            print(f"  Table {ti}: {len(rows)} rows x {cols} cols  gridCol widths (twips) = {widths}")
-            # First row text
-            if rows:
-                cells = rows[0].findall(W+"tc")
-                hdr = []
-                for c in cells:
-                    t = "".join([get_text_of_p(p) for p in c.iter(W+"p")])
-                    hdr.append(t[:30])
-                print(f"    Header: {' | '.join(hdr)}")
-        print()
-        # Styles
-        try:
-            styles_xml = z.read("word/styles.xml").decode("utf-8", errors="replace")
-            print(f"STYLES: word/styles.xml length = {len(styles_xml)} bytes")
-            print(f"  Has Heading1? {'Heading1' in styles_xml or 'Heading 1' in styles_xml}")
-            print(f"  Has Table Grid? {'Table Grid' in styles_xml}")
-            if len(styles_xml) < 2000:
-                print("  WARNING: styles.xml is tiny - file was rebuilt from scratch, formatting was lost.")
-        except KeyError:
-            print("  WARNING: no word/styles.xml")
-        print()
-        print("RULE: This script only READS. It never writes a new DOCX.")
+    ap = argparse.ArgumentParser(description="Read-only DOCX health check")
+    ap.add_argument("docx")
+    ap.add_argument("--full-text", action="store_true")
+    ap.add_argument("--protect", action="append", default=[],
+                    help="literal to count (A* is always counted)")
+    a = ap.parse_args()
+    protect = ["A*"] + [p for p in a.protect if p != "A*"]
+
+    try:
+        if not zipfile.is_zipfile(a.docx):
+            print(f"NOT A DOCX/ZIP: {a.docx}")
+            print("You only have text, not the real file bytes. Do NOT rebuild a DOCX from it.")
+            print("Get the real file, or return a change list (Original -> Revised).")
+            sys.exit(2)
+        z = zipfile.ZipFile(a.docx)
+    except OSError as exc:
+        print(f"ERROR: {exc}"); sys.exit(1)
+
+    names = z.namelist()
+    warnings = []
+    print(f"=== {a.docx} ===\nREAL BYTES: yes (valid ZIP, {len(names)} parts)\n")
+
+    print("--- Parts ---")
+    for info in z.infolist():
+        line = f"  {info.filename:45s} {info.file_size:>10,d} B"
+        if info.filename.startswith("word/media/"):
+            line += f"  sha256={hashlib.sha256(z.read(info.filename)).hexdigest()}"
+        print(line)
+
+    if "word/document.xml" not in names:
+        print("\nNo word/document.xml - this is not a Word document."); sys.exit(2)
+    doc = z.read("word/document.xml").decode("utf-8", "replace")
+    styles = z.read("word/styles.xml").decode("utf-8", "replace") if "word/styles.xml" in names else ""
+    snames = style_names(styles)
+
+    print("\n--- Styles & theme ---")
+    print(f"  styles.xml: {len(styles.encode()):,d} B, {len(snames)} styles defined")
+    has_theme = any(n.startswith("word/theme/") for n in names)
+    print(f"  theme: {'present' if has_theme else 'MISSING'}")
+    if len(styles.encode()) < 2000:
+        warnings.append("styles.xml is under 2 KB - typical of a file rebuilt from scratch")
+    if not has_theme:
+        warnings.append("no word/theme/ part - Word always writes one; file may be rebuilt")
+
+    paras = para_list(doc, snames)
+    used = Counter(s for s, _ in paras)
+    print(f"\n--- Paragraph styles in use ({len(paras)} paragraphs) ---")
+    for s, c in used.most_common():
+        print(f"  {c:5d}  {s}")
+    heads = [(s, t) for s, t in paras if re.match(r"(?i)(title|heading)", s)]
+    if paras and not heads:
+        warnings.append("no Title/Heading styles used - headings may have been flattened to Normal")
+
+    print("\n--- Outline ---")
+    for s, t in heads[:60]:
+        print(f"  [{s}] {t[:90]}")
+    if len(heads) > 60:
+        print(f"  ... {len(heads) - 60} more")
+
+    tables = TBL_RE.findall(doc)
+    print(f"\n--- Tables ({len(tables)}) ---")
+    for i, t in enumerate(tables, 1):
+        cols = [int(x) for x in GRID_RE.findall(t)]
+        flag = ""
+        if len(cols) >= 3 and len(set(cols)) == 1:
+            # Not a warning by itself: new Word tables start with equal columns.
+            flag = "  <- all equal (normal for a new table; suspicious if the original had varied widths)"
+        print(f"  Table {i}: gridCol twips {cols}{flag}")
+
+    print("\n--- Headers / footers / notes ---")
+    hf = [n for n in names if re.match(r"word/(header\d*|footer\d*|footnotes|endnotes)\.xml$", n)]
+    for n in hf:
+        x = z.read(n).decode("utf-8", "replace")
+        page = bool(re.search(r"\bPAGE\b", x))
+        txt = "".join(unescape(t) for t in WT_RE.findall(x)).strip()
+        print(f"  {n}: PAGE field={'yes' if page else 'no'}  text={txt[:60]!r}")
+    if not hf:
+        print("  none")
+
+    print("\n--- Counts (word/document.xml) ---")
+    full = "\n".join(t for _, t in paras)
+    for lit in protect:
+        print(f"  literal {lit!r}: {full.count(lit)}")
+    for label, pat in (("highlights <w:highlight", "<w:highlight"), ("tracked insertions <w:ins ", "<w:ins "),
+                       ("tracked deletions <w:del ", "<w:del "), ("comment refs", "<w:commentReference"),
+                       ("xml:space", "xml:space"), ("images r:embed", "r:embed")):
+        print(f"  {label}: {doc.count(pat)}")
+    print(f"  words (approx): {len(full.split()):,d}")
+
+    if a.full_text:
+        print("\n--- Full text (style | text) ---")
+        for s, t in paras:
+            print(f"[{s}] {t}")
+
+    print("\n--- Verdict ---")
+    if warnings:
+        for w in warnings:
+            print(f"  WARN: {w}")
+        print("  This file may already be damaged. Tell the user; do not use it as the master.")
+    else:
+        print("  No damage signs found.")
+    sys.exit(0)
+
 
 if __name__ == "__main__":
     main()
